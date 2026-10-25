@@ -1,16 +1,4 @@
-import axios, { type AxiosRequestConfig } from "axios";
-
-const USER_AGENTS = [
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15",
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
-];
-
-function pickUserAgent(): string {
-  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
-}
+import { gotScraping } from "got-scraping";
 
 export interface FetchOptions {
   acceptLanguage?: string;
@@ -74,51 +62,47 @@ function mergeCookies(prev: string, setCookie: string[] | undefined): string {
 }
 
 /**
- * GET a URL with browser-like headers, UA rotation and exponential backoff.
+ * GET a URL with browser-like TLS/HTTP2 fingerprints (via got-scraping) and exponential backoff.
  * Amazon and CamelCamelCamel block obvious bots, so we mimic a real browser and
  * transparently follow up to 2 bot-manager meta-refresh challenge hops, carrying
  * the bm-verify token and any Set-Cookie values forward (as a real browser does).
  */
 export async function fetchHtml(url: string, opts: FetchOptions = {}): Promise<string> {
-  const { acceptLanguage = "en-US,en;q=0.9", retries = 3, timeoutMs = 15000, headers = {} } = opts;
+  const { acceptLanguage = "en-US", retries = 3, timeoutMs = 15000, headers = {} } = opts;
+  const primaryLocale = acceptLanguage.split(",")[0].trim().split(";")[0] || "en-US";
 
   let lastErr: unknown;
   for (let attempt = 0; attempt <= retries; attempt++) {
-    const ua = pickUserAgent(); // keep a stable UA across hops within one attempt
     let cookies = "";
     try {
       let currentUrl = url;
       let body = "";
 
       for (let hop = 0; hop <= 2; hop++) {
-        const config: AxiosRequestConfig = {
-          timeout: timeoutMs,
+        const mergedHeaders: Record<string, string> = { ...headers };
+        if (cookies) {
+          mergedHeaders["cookie"] = cookies;
+        }
+
+        const res = await gotScraping({
+          url: currentUrl,
+          timeout: { request: timeoutMs },
           maxRedirects: 5,
-          responseType: "text",
-          // Accept any 2xx-4xx so we can inspect blocked/captcha pages instead of throwing.
-          validateStatus: (s) => s < 500,
-          headers: {
-            "User-Agent": ua,
-            Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": acceptLanguage,
-            "Accept-Encoding": "gzip, deflate, br",
-            "Cache-Control": "no-cache",
-            Pragma: "no-cache",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": hop === 0 ? "none" : "same-origin",
-            "Upgrade-Insecure-Requests": "1",
-            ...(cookies ? { Cookie: cookies } : {}),
-            ...headers,
+          throwHttpErrors: false,
+          headers: Object.keys(mergedHeaders).length > 0 ? mergedHeaders : undefined,
+          headerGeneratorOptions: {
+            browsers: [{ name: "chrome" }],
+            devices: ["desktop"],
+            operatingSystems: ["windows"],
+            locales: [primaryLocale],
           },
-        };
+        });
 
-        const res = await axios.get<string>(currentUrl, config);
-        body = res.data ?? "";
-        cookies = mergeCookies(cookies, res.headers?.["set-cookie"] as string[] | undefined);
+        body = res.body;
+        cookies = mergeCookies(cookies, res.headers["set-cookie"]);
 
-        if (res.status === 429 || res.status === 503) {
-          throw new Error(`Rate limited (HTTP ${res.status})`);
+        if (res.statusCode === 429 || res.statusCode === 503) {
+          throw new Error(`Rate limited (HTTP ${res.statusCode})`);
         }
         if (typeof body === "string" && CAPTCHA_RE.test(body)) {
           throw new Error("Blocked by Amazon bot detection (CAPTCHA page)");
