@@ -1,7 +1,10 @@
 import { gotScraping } from "got-scraping";
+import { MARKETPLACES } from "../config.js";
+import { clearSessionCookies, getSessionCookies, saveSessionCookies } from "./cache.js";
 
 export interface FetchOptions {
   acceptLanguage?: string;
+  marketplace?: string;
   /** Number of retry attempts on transient failures. Default 3. */
   retries?: number;
   timeoutMs?: number;
@@ -61,19 +64,51 @@ function mergeCookies(prev: string, setCookie: string[] | undefined): string {
   return [...jar.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
 }
 
+/** Infer the Amazon marketplace code from a URL or explicit parameter. */
+function inferMarketplace(url: string, explicitCode?: string): string | null {
+  if (explicitCode) return explicitCode.toUpperCase();
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    for (const [code, mp] of Object.entries(MARKETPLACES)) {
+      if (mp.host.toLowerCase() === host) return code;
+    }
+  } catch {}
+  return null;
+}
+
+let lastRequestTime = 0;
+const MIN_REQUEST_INTERVAL_MS = 1500;
+
+/** Throttles requests with random jitter to stay under Amazon WAF burst rate limits. */
+async function throttle(): Promise<void> {
+  const now = Date.now();
+  const elapsed = now - lastRequestTime;
+  if (elapsed < MIN_REQUEST_INTERVAL_MS) {
+    const jitter = Math.floor(Math.random() * 600);
+    await sleep(MIN_REQUEST_INTERVAL_MS - elapsed + jitter);
+  }
+  lastRequestTime = Date.now();
+}
+
 /**
- * GET a URL with browser-like TLS/HTTP2 fingerprints (via got-scraping) and exponential backoff.
- * Amazon and CamelCamelCamel block obvious bots, so we mimic a real browser and
- * transparently follow up to 2 bot-manager meta-refresh challenge hops, carrying
- * the bm-verify token and any Set-Cookie values forward (as a real browser does).
+ * GET a URL with browser-like TLS/HTTP2 fingerprints (via got-scraping), persistent session cookies,
+ * rate throttling, and exponential backoff.
  */
 export async function fetchHtml(url: string, opts: FetchOptions = {}): Promise<string> {
   const { acceptLanguage = "en-US", retries = 3, timeoutMs = 15000, headers = {} } = opts;
   const primaryLocale = acceptLanguage.split(",")[0].trim().split(";")[0] || "en-US";
+  const mpCode = inferMarketplace(url, opts.marketplace);
 
   let lastErr: unknown;
   for (let attempt = 0; attempt <= retries; attempt++) {
-    let cookies = "";
+    // 1. Throttle requests to prevent bursting WAF velocity alarms
+    await throttle();
+
+    // 2. Load seed cookies: env var override first, then persistent SQLite cache
+    const envCookie = mpCode ? (process.env[`AMAZON_COOKIE_${mpCode}`] || process.env.AMAZON_COOKIE || "").trim() : "";
+    const cachedCookie = mpCode ? getSessionCookies(mpCode) : "";
+    let cookies = mergeCookies(cachedCookie, envCookie ? [envCookie] : undefined);
+
     try {
       let currentUrl = url;
       let body = "";
@@ -101,10 +136,16 @@ export async function fetchHtml(url: string, opts: FetchOptions = {}): Promise<s
         body = res.body;
         cookies = mergeCookies(cookies, res.headers["set-cookie"]);
 
+        // Persist accumulated session cookies to SQLite
+        if (mpCode && cookies) {
+          saveSessionCookies(mpCode, cookies);
+        }
+
         if (res.statusCode === 429 || res.statusCode === 503) {
           throw new Error(`Rate limited (HTTP ${res.statusCode})`);
         }
         if (typeof body === "string" && CAPTCHA_RE.test(body)) {
+          if (mpCode) clearSessionCookies(mpCode);
           throw new Error("Blocked by Amazon bot detection (CAPTCHA page)");
         }
         if (typeof body === "string" && isWafChallenge(body)) {
